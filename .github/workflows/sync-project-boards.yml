@@ -34,25 +34,22 @@ jobs:
             }
 
             async function findProject(title, owner) {
-              const result = await github.graphql(`
-                query($owner: String!) {
-                  user(login: $owner) {
-                    projectsV2(first: 100) {
-                      nodes { id title number }
+              const { data: account } = await github.rest.users.getByUsername({ username: owner });
+              const query = account.type === 'Organization'
+                ? `query($owner: String!) {
+                    organization(login: $owner) {
+                      projectsV2(first: 100) { nodes { id title number } }
                     }
-                  }
-                  organization(login: $owner) {
-                    projectsV2(first: 100) {
-                      nodes { id title number }
+                  }`
+                : `query($owner: String!) {
+                    user(login: $owner) {
+                      projectsV2(first: 100) { nodes { id title number } }
                     }
-                  }
-                }
-              `, { owner });
-
-              const projects = [
-                ...(result.user?.projectsV2.nodes ?? []),
-                ...(result.organization?.projectsV2.nodes ?? []),
-              ];
+                  }`;
+              const result = await github.graphql(query, { owner });
+              const projects = account.type === 'Organization'
+                ? result.organization?.projectsV2.nodes ?? []
+                : result.user?.projectsV2.nodes ?? [];
               const project = projects.find((candidate) => candidate.title === title);
               if (!project) {
                 throw new Error(`Could not find project ${title} for ${owner}.`);
