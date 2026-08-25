@@ -1,15 +1,15 @@
 name: Sync project boards
 
 on:
-  projects_v2_item:
-    types: [edited]
+  schedule:
+    - cron: '*/1 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   sync-status:
-    if: ${{ github.event.projects_v2_item.content_type == 'Issue' || github.event.projects_v2_item.content_type == 'PullRequest' }}
     runs-on: ubuntu-latest
     steps:
       - name: Copy Client Board status to Event Bus Board
@@ -27,7 +27,6 @@ jobs:
             const eventBusBoardTitle = process.env.EVENT_BUS_BOARD_TITLE;
             const clientBoardOwner = process.env.CLIENT_BOARD_OWNER;
             const eventBusBoardOwner = process.env.EVENT_BUS_BOARD_OWNER;
-            const itemId = context.payload.projects_v2_item.node_id;
 
             if (!process.env.PROJECTS_TOKEN) {
               core.setFailed('The PROJECTS_TOKEN secret is required.');
@@ -61,102 +60,91 @@ jobs:
               return project;
             }
 
-            const source = await github.graphql(`
-              query($itemId: ID!) {
-                node(id: $itemId) {
-                  ... on ProjectV2Item {
-                    project { id title }
-                    content {
-                      ... on Issue { id number }
-                      ... on PullRequest { id number }
-                    }
-                    fieldValues(first: 100) {
-                      nodes {
-                        ... on ProjectV2ItemFieldSingleSelectValue {
-                          name
-                          field { ... on ProjectV2SingleSelectField { name } }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            `, { itemId });
-
-            const sourceItem = source.node;
-            const content = sourceItem?.content;
-            if (!sourceItem || !content) {
-              core.info('The changed project item has no issue or pull request content.');
-              return;
-            }
-
             const clientBoard = await findProject(clientBoardTitle, clientBoardOwner);
-            if (sourceItem.project.id !== clientBoard.id) {
-              core.info(`Ignoring an edit from ${sourceItem.project.title}.`);
-              return;
-            }
-
-            const sourceStatus = sourceItem.fieldValues.nodes.find(
-              (value) => value.field?.name === 'Status'
-            )?.name;
-            if (!sourceStatus) {
-              core.info('The source item has no Status value.');
-              return;
-            }
-
             const eventBusBoard = await findProject(eventBusBoardTitle, eventBusBoardOwner);
-            const destination = await github.graphql(`
-              query($projectId: ID!) {
-                node(id: $projectId) {
-                  ... on ProjectV2 {
-                    fields(first: 100) {
-                      nodes {
-                        ... on ProjectV2SingleSelectField {
-                          id name
-                          options { id name }
+
+            async function loadProject(projectId) {
+              return github.graphql(`
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      fields(first: 100) {
+                        nodes {
+                          ... on ProjectV2SingleSelectField {
+                            id name
+                            options { id name }
+                          }
                         }
                       }
-                    }
-                    items(first: 100) {
-                      nodes {
-                        id
-                        content { ... on Issue { id } ... on PullRequest { id } }
+                      items(first: 100) {
+                        nodes {
+                          id
+                          content { ... on Issue { id } ... on PullRequest { id } }
+                          fieldValues(first: 100) {
+                            nodes {
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field { ... on ProjectV2SingleSelectField { name } }
+                              }
+                            }
+                          }
+                        }
                       }
                     }
                   }
                 }
+              `, { projectId });
+            }
+
+            const sourceProject = (await loadProject(clientBoard.id)).node;
+            const destinationProject = (await loadProject(eventBusBoard.id)).node;
+            const destinationStatusField = destinationProject.fields.nodes.find(
+              (field) => field.name === 'Status'
+            );
+            let updatedCount = 0;
+
+            for (const sourceItem of sourceProject.items.nodes) {
+              const content = sourceItem.content;
+              const sourceStatus = sourceItem.fieldValues.nodes.find(
+                (value) => value.field?.name === 'Status'
+              )?.name;
+              if (!content || !sourceStatus) continue;
+
+              const targetItem = destinationProject.items.nodes.find(
+                (item) => item.content?.id === content.id
+              );
+              if (!targetItem) continue;
+
+              const statusOption = destinationStatusField?.options.find(
+                (option) => option.name === sourceStatus
+              );
+              if (!statusOption) {
+                throw new Error(`Event Bus Board has no Status option named ${sourceStatus}.`);
               }
-            `, { projectId: eventBusBoard.id });
 
-            const project = destination.node;
-            const targetItem = project.items.nodes.find((item) => item.content?.id === content.id);
-            const statusField = project.fields.nodes.find((field) => field.name === 'Status');
-            const statusOption = statusField?.options.find((option) => option.name === sourceStatus);
+              const targetStatus = targetItem.fieldValues.nodes.find(
+                (value) => value.field?.name === 'Status'
+              )?.name;
+              if (targetStatus === sourceStatus) continue;
 
-            if (!targetItem) {
-              core.info('The ticket is not assigned to Event Bus Board.');
-              return;
-            }
-            if (!statusOption) {
-              throw new Error(`Event Bus Board has no Status option named ${sourceStatus}.`);
-            }
-
-            await github.graphql(`
-              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                updateProjectV2ItemFieldValue(input: {
-                  projectId: $projectId
-                  itemId: $itemId
-                  fieldId: $fieldId
-                  value: { singleSelectOptionId: $optionId }
-                }) {
-                  projectV2Item { id }
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) {
+                    projectV2Item { id }
+                  }
                 }
-              }
-            `, {
-              projectId: eventBusBoard.id,
-              itemId: targetItem.id,
-              fieldId: statusField.id,
-              optionId: statusOption.id,
-            });
+              `, {
+                projectId: eventBusBoard.id,
+                itemId: targetItem.id,
+                fieldId: destinationStatusField.id,
+                optionId: statusOption.id,
+              });
+              updatedCount += 1;
+            }
 
-            core.info(`Updated ${eventBusBoardTitle} status to ${sourceStatus}.`);
+            core.info(`Updated ${updatedCount} item(s) on ${eventBusBoardTitle}.`);
