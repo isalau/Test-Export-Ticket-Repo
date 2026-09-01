@@ -5,12 +5,17 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: sync-project-boards
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   sync-status:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Copy Client Board status to Event Bus Board
         uses: actions/github-script@v8
@@ -20,111 +25,190 @@ jobs:
           EVENT_BUS_BOARD_TITLE: Event Bus Board
           CLIENT_BOARD_OWNER: ${{ vars.CLIENT_BOARD_OWNER || github.repository_owner }}
           EVENT_BUS_BOARD_OWNER: ${{ vars.EVENT_BUS_BOARD_OWNER || github.repository_owner }}
+          STATUS_FIELD_NAME: Status
         with:
           github-token: ${{ secrets.PROJECTS_TOKEN }}
           script: |
-            const clientBoardTitle = process.env.CLIENT_BOARD_TITLE;
-            const eventBusBoardTitle = process.env.EVENT_BUS_BOARD_TITLE;
-            const clientBoardOwner = process.env.CLIENT_BOARD_OWNER;
-            const eventBusBoardOwner = process.env.EVENT_BUS_BOARD_OWNER;
+            const clientBoardTitle = process.env.CLIENT_BOARD_TITLE?.trim();
+            const eventBusBoardTitle = process.env.EVENT_BUS_BOARD_TITLE?.trim();
+            const clientBoardOwner = process.env.CLIENT_BOARD_OWNER?.trim();
+            const eventBusBoardOwner = process.env.EVENT_BUS_BOARD_OWNER?.trim();
+            const statusFieldName = process.env.STATUS_FIELD_NAME?.trim() || 'Status';
 
             if (!process.env.PROJECTS_TOKEN) {
               core.setFailed('The PROJECTS_TOKEN secret is required.');
               return;
             }
 
-            async function findProject(title, owner) {
-              const { data: account } = await github.rest.users.getByUsername({ username: owner });
-              const query = account.type === 'Organization'
-                ? `query($owner: String!) {
-                    organization(login: $owner) {
-                      projectsV2(first: 100) { nodes { id title number } }
-                    }
-                  }`
-                : `query($owner: String!) {
-                    user(login: $owner) {
-                      projectsV2(first: 100) { nodes { id title number } }
-                    }
-                  }`;
-              const result = await github.graphql(query, { owner });
-              const projects = account.type === 'Organization'
-                ? result.organization?.projectsV2.nodes ?? []
-                : result.user?.projectsV2.nodes ?? [];
-              const project = projects.find((candidate) => candidate.title === title);
-              if (!project) {
-                throw new Error(`Could not find project ${title} for ${owner}.`);
-              }
-              return project;
+            if (!clientBoardTitle || !eventBusBoardTitle) {
+              core.setFailed('CLIENT_BOARD_TITLE and EVENT_BUS_BOARD_TITLE must be set.');
+              return;
             }
 
-            const clientBoard = await findProject(clientBoardTitle, clientBoardOwner);
-            const eventBusBoard = await findProject(eventBusBoardTitle, eventBusBoardOwner);
+            if (clientBoardTitle === eventBusBoardTitle && clientBoardOwner === eventBusBoardOwner) {
+              core.setFailed('The source and destination project titles must be different for a sync to run.');
+              return;
+            }
+
+            async function findProject(title, owner) {
+              const query = `
+                query($owner: String!, $first: Int!, $after: String) {
+                  user(login: $owner) {
+                    projectsV2(first: $first, after: $after) {
+                      nodes { id title number }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                  }
+                  organization(login: $owner) {
+                    projectsV2(first: $first, after: $after) {
+                      nodes { id title number }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                  }
+                }
+              `;
+
+              let after = null;
+              let hasNextPage = true;
+
+              while (hasNextPage) {
+                const result = await github.graphql(query, { owner, first: 100, after });
+                const userProjects = result.user?.projectsV2?.nodes ?? [];
+                const orgProjects = result.organization?.projectsV2?.nodes ?? [];
+                const candidates = [...userProjects, ...orgProjects];
+                const project = candidates.find((candidate) => candidate.title === title);
+
+                if (project) {
+                  return project;
+                }
+
+                const userPageInfo = result.user?.projectsV2?.pageInfo;
+                const orgPageInfo = result.organization?.projectsV2?.pageInfo;
+                hasNextPage = Boolean(userPageInfo?.hasNextPage || orgPageInfo?.hasNextPage);
+                after = userPageInfo?.endCursor ?? orgPageInfo?.endCursor ?? null;
+
+                if (!after) {
+                  break;
+                }
+              }
+
+              throw new Error(`Could not find project "${title}" for owner "${owner}".`);
+            }
 
             async function loadProject(projectId) {
-              return github.graphql(`
-                query($projectId: ID!) {
-                  node(id: $projectId) {
-                    ... on ProjectV2 {
-                      fields(first: 100) {
-                        nodes {
-                          ... on ProjectV2SingleSelectField {
-                            id name
-                            options { id name }
+              const fields = [];
+              const items = [];
+              let fieldsAfter = null;
+              let itemsAfter = null;
+
+              while (true) {
+                const result = await github.graphql(`
+                  query($projectId: ID!, $fieldsAfter: String, $itemsAfter: String) {
+                    node(id: $projectId) {
+                      ... on ProjectV2 {
+                        fields(first: 100, after: $fieldsAfter) {
+                          nodes {
+                            ... on ProjectV2SingleSelectField {
+                              id name
+                              options { id name }
+                            }
                           }
+                          pageInfo { hasNextPage endCursor }
                         }
-                      }
-                      items(first: 100) {
-                        nodes {
-                          id
-                          content { ... on Issue { id } ... on PullRequest { id } }
-                          fieldValues(first: 100) {
-                            nodes {
-                              ... on ProjectV2ItemFieldSingleSelectValue {
-                                name
-                                field { ... on ProjectV2SingleSelectField { name } }
+                        items(first: 100, after: $itemsAfter) {
+                          nodes {
+                            id
+                            content { ... on Issue { id } ... on PullRequest { id } }
+                            fieldValues(first: 100) {
+                              nodes {
+                                ... on ProjectV2ItemFieldSingleSelectValue {
+                                  name
+                                  field { ... on ProjectV2SingleSelectField { name } }
+                                }
                               }
                             }
                           }
+                          pageInfo { hasNextPage endCursor }
                         }
                       }
                     }
                   }
+                `, { projectId, fieldsAfter, itemsAfter });
+
+                const project = result.node;
+                if (!project) {
+                  throw new Error(`Project ${projectId} could not be loaded.`);
                 }
-              `, { projectId });
+
+                fields.push(...(project.fields?.nodes ?? []));
+                items.push(...(project.items?.nodes ?? []));
+
+                const fieldsPageInfo = project.fields?.pageInfo;
+                const itemsPageInfo = project.items?.pageInfo;
+
+                if (!fieldsPageInfo?.hasNextPage && !itemsPageInfo?.hasNextPage) {
+                  break;
+                }
+
+                fieldsAfter = fieldsPageInfo?.hasNextPage ? fieldsPageInfo.endCursor : null;
+                itemsAfter = itemsPageInfo?.hasNextPage ? itemsPageInfo.endCursor : null;
+
+                if (!fieldsAfter && !itemsAfter) {
+                  break;
+                }
+              }
+
+              return { fields, items };
             }
 
-            const sourceProject = (await loadProject(clientBoard.id)).node;
-            const destinationProject = (await loadProject(eventBusBoard.id)).node;
-            const destinationStatusField = destinationProject.fields.nodes.find(
-              (field) => field.name === 'Status'
-            );
+            const clientBoard = await findProject(clientBoardTitle, clientBoardOwner);
+            const eventBusBoard = await findProject(eventBusBoardTitle, eventBusBoardOwner);
+            const sourceProject = await loadProject(clientBoard.id);
+            const destinationProject = await loadProject(eventBusBoard.id);
+
+            const destinationStatusField = destinationProject.fields.find((field) => field.name === statusFieldName);
+            if (!destinationStatusField) {
+              throw new Error(`Project "${eventBusBoardTitle}" does not contain a "${statusFieldName}" field.`);
+            }
+
             let updatedCount = 0;
             let processedCount = 0;
 
-            for (const sourceItem of sourceProject.items.nodes) {
+            for (const sourceItem of sourceProject.items) {
               const content = sourceItem.content;
               const sourceStatus = sourceItem.fieldValues.nodes.find(
-                (value) => value.field?.name === 'Status'
+                (value) => value.field?.name === statusFieldName
               )?.name;
-              if (!content || !sourceStatus) continue;
+
+              if (!content || !sourceStatus) {
+                continue;
+              }
+
               processedCount += 1;
 
-              const targetItem = destinationProject.items.nodes.find(
+              const targetItem = destinationProject.items.find(
                 (item) => item.content?.id === content.id
               );
-              if (!targetItem) continue;
 
-              const statusOption = destinationStatusField?.options.find(
+              if (!targetItem) {
+                continue;
+              }
+
+              const statusOption = destinationStatusField.options.find(
                 (option) => option.name === sourceStatus
               );
+
               if (!statusOption) {
-                throw new Error(`Event Bus Board has no Status option named ${sourceStatus}.`);
+                throw new Error(`Project "${eventBusBoardTitle}" has no "${statusFieldName}" option named "${sourceStatus}".`);
               }
 
               const targetStatus = targetItem.fieldValues.nodes.find(
-                (value) => value.field?.name === 'Status'
+                (value) => value.field?.name === statusFieldName
               )?.name;
-              if (targetStatus === sourceStatus) continue;
+
+              if (targetStatus === sourceStatus) {
+                continue;
+              }
 
               await github.graphql(`
                 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
@@ -143,6 +227,7 @@ jobs:
                 fieldId: destinationStatusField.id,
                 optionId: statusOption.id,
               });
+
               updatedCount += 1;
             }
 
