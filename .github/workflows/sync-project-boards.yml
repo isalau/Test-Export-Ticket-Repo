@@ -2,7 +2,7 @@ name: Sync project boards
 
 on:
   schedule:
-    - cron: '*/1 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -99,6 +99,7 @@ jobs:
               (field) => field.name === 'Status'
             );
             let updatedCount = 0;
+            let processedCount = 0;
 
             for (const sourceItem of sourceProject.items.nodes) {
               const content = sourceItem.content;
@@ -106,6 +107,7 @@ jobs:
                 (value) => value.field?.name === 'Status'
               )?.name;
               if (!content || !sourceStatus) continue;
+              processedCount += 1;
 
               const targetItem = destinationProject.items.nodes.find(
                 (item) => item.content?.id === content.id
@@ -144,4 +146,4 @@ jobs:
               updatedCount += 1;
             }
 
-            core.info(`Updated ${updatedCount} item(s) on ${eventBusBoardTitle}.`);
+            core.info(`Processed ${processedCount} item(s) from ${clientBoardTitle}; updated ${updatedCount} item(s) on ${eventBusBoardTitle}.`);
