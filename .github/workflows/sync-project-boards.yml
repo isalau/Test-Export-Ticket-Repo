@@ -1,9 +1,10 @@
 name: Sync project boards
 
 on:
-  schedule:
-    - cron: '*/1 * * * *'
-  workflow_dispatch:
+  project_card:
+    types: [moved] # Fires when a card is moved between columns (statuses)
+  issues:
+    types: [edited] # Fires if you use issue labels/milestones for status
 
 permissions:
   contents: read
